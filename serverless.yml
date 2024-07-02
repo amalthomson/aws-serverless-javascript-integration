@@ -1,0 +1,153 @@
+service: api-sqs-lambda-ssm-s3-integration
+
+# Provider configuration
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}  
+  region: ${opt:region, 'us-east-1'}  
+  
+  # IAM role configuration for Lambda function
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt MyQueue.Arn
+
+        # Allow Lambda to read from SSM Parameter Store
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+            - ssm:GetParametersByPath
+          Resource: "arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter/country"
+
+        # Allow Lambda to access S3 bucket
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource: "arn:aws:s3:::api-sqs-lambda-ssm-s3-integration/*"
+
+# Custom section for serverless-ssm-fetch plugin
+custom:
+  serverlessSsmFetch:
+    country: '/country'
+
+# Lambda function configuration
+functions:
+  sqsConsumer:
+    handler: index.handler
+    events:
+      - sqs:
+          arn: !GetAtt MyQueue.Arn
+          batchSize: 10  # Process 10 messages at a time
+    environment:
+      country: ${self:custom.serverlessSsmFetch.country}
+
+# AWS resources configuration
+resources:
+  Resources:
+    # SQS Queue
+    MyQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-queue
+
+    # API Gateway REST API
+    ApiGatewayRestApi:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-api
+
+    # API Resource
+    ApiResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+        PathPart: 'send-message'
+        RestApiId: !Ref ApiGatewayRestApi
+
+    # API Method
+    ApiMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: POST
+        ResourceId: !Ref ApiResource
+        RestApiId: !Ref ApiGatewayRestApi
+        AuthorizationType: NONE
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: POST
+          Uri: !Sub 
+            - arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${QueueName}
+            - {QueueName: !GetAtt MyQueue.QueueName}
+          IntegrationResponses:
+            - StatusCode: 200
+              ResponseTemplates:
+                application/json: |
+                                    #set($inputRoot = $input.path('$'))
+                                    {"message": "The Message was received, please be patient your request is being processed. Thank you\n",
+                                    "reference_id": "$inputRoot.SendMessageResponse.SendMessageResult.MessageId"}
+          RequestParameters:
+            integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+          RequestTemplates:
+            application/json: 'Action=SendMessage&MessageBody=$input.body'
+          Credentials: !GetAtt ApiGatewayRole.Arn
+        MethodResponses:
+          - StatusCode: 200
+            ResponseModels:
+              application/json: 'Empty'
+
+    # IAM Role for API Gateway
+    ApiGatewayRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - apigateway.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: AllowSQSAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource: !GetAtt MyQueue.Arn
+
+    # API Gateway Deployment
+    ApiGatewayDeployment:
+      Type: AWS::ApiGateway::Deployment
+      DependsOn: ApiMethod
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        StageName: ${self:provider.stage}
+
+package:
+  individually: true
+  # patterns:
+  #   - '!.serverless/**'
+  #   - '!node_modules/**'
+
+# Serverless plugins
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-ssm-fetch
+
+outputs:
+  QueueUrl:
+    Value: !Ref MyQueue
+    Description: URL of the SQS queue
+  ApiEndpoint:
+    Value: !Sub https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}/send-message
+    Description: URL of the API Gateway endpoint
